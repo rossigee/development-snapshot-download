@@ -235,7 +235,7 @@ func download(w http.ResponseWriter, req *http.Request) {
 		//fmt.Println("Entering input loop (object to GnuPG)")
 		for {
 			bytecount, err := io.CopyN(stdin, object, 1000000)
-			if err != nil {
+			if err != nil && err != io.EOF {
 				handleError(w, "Transferring object from storage: "+err.Error())
 				cmd.Process.Kill()
 				return
@@ -253,7 +253,7 @@ func download(w http.ResponseWriter, req *http.Request) {
 		//fmt.Println("Entering output loop (GnuPG to response)")
 		for {
 			bytecount, err := io.CopyN(w, stdout, 1000000)
-			if err != nil {
+			if err != nil && err != io.EOF {
 				handleError(w, "Transferring decrypted file to response: "+err.Error())
 				cmd.Process.Kill()
 				return
@@ -266,12 +266,12 @@ func download(w http.ResponseWriter, req *http.Request) {
 		//fmt.Println("Exiting output loop")
 	}()
 
-	// Loop reading from GnuPG stderr and writing to response
+	// Loop passing GnuPG stderr to our own stderr
 	go func() {
 		//fmt.Println("Entering stderr loop (GnuPG to response)")
 		for {
-			bytecount, err := io.CopyN(w, stderr, 1000000)
-			if err != nil {
+			bytecount, err := io.CopyN(os.Stderr, stderr, 1000000)
+			if err != nil && err != io.EOF {
 				handleError(w, "Transferring stderr to response: "+err.Error())
 				cmd.Process.Kill()
 				return
