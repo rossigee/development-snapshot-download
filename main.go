@@ -26,7 +26,8 @@ var esUsername = os.Getenv("ELASTICSEARCH_USERNAME")
 var esPassword = os.Getenv("ELASTICSEARCH_PASSWORD")
 var backupId = os.Getenv("BACKUP_ID")
 var vaultAddr = os.Getenv("VAULT_ADDR")
-var vaultToken = os.Getenv("VAULT_TOKEN")
+var vaultAppRoleId = os.Getenv("VAULT_APP_ROLE_ID")
+var vaultAppSecretId = os.Getenv("VAULT_APP_SECRET_ID")
 var passphraseSecretPath = os.Getenv("PASSPHRASE_SECRET_PATH")
 var passphraseSecretKey = os.Getenv("PASSPHRASE_SECRET_KEY")
 var storageURL = os.Getenv("STORAGE_URL")
@@ -106,7 +107,20 @@ func _fetch_passphrase() (*string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("Connecting to Vault: %w", err)
 	}
-	client.SetToken(vaultToken)
+
+	data := map[string]interface{}{
+		"role_id":   vaultAppRoleId,
+		"secret_id": vaultAppSecretId,
+	}
+	resp, err := client.Logical().Write("auth/approle/login", data)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Auth == nil {
+		return nil, fmt.Errorf("no auth info returned")
+	}
+	client.SetToken(resp.Auth.ClientToken)
+
 	secret, err := client.Logical().Read(passphraseSecretPath)
 	if err != nil {
 		return nil, fmt.Errorf("Reading passphrase key: %w", err)
@@ -185,6 +199,9 @@ func download(w http.ResponseWriter, req *http.Request) {
 
 	// Start up a GnuPG decrypt process
 	cmd := exec.Command("gpg", "--batch", "--passphrase-fd", "3")
+	cmd.Env = append(os.Environ(),
+		"GNUPGHOME=/tmp",
+	)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		handleError(w, "GnuPG stdin: "+err.Error())
@@ -206,6 +223,13 @@ func download(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// Grab descriptor for decrypted output from GnuPG
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		handleError(w, "GnuPG stderr: "+err.Error())
+		return
+	}
+
 	// Loop reading from object and writing to GnuPG
 	go func() {
 		//fmt.Println("Entering input loop (object to GnuPG)")
@@ -224,7 +248,7 @@ func download(w http.ResponseWriter, req *http.Request) {
 		//fmt.Println("Exiting input loop")
 	}()
 
-	// Loop reading from GnuPG and writing to response
+	// Loop reading from GnuPG stdout and writing to response
 	go func() {
 		//fmt.Println("Entering output loop (GnuPG to response)")
 		for {
@@ -242,6 +266,24 @@ func download(w http.ResponseWriter, req *http.Request) {
 		//fmt.Println("Exiting output loop")
 	}()
 
+	// Loop reading from GnuPG stderr and writing to response
+	go func() {
+		//fmt.Println("Entering stderr loop (GnuPG to response)")
+		for {
+			bytecount, err := io.CopyN(w, stderr, 1000000)
+			if err != nil {
+				handleError(w, "Transferring stderr to response: "+err.Error())
+				cmd.Process.Kill()
+				return
+			}
+			//fmt.Printf("Wrote %d\n", bytecount)
+			if bytecount <= 0 {
+				break
+			}
+		}
+		//fmt.Println("Exiting stderr loop")
+	}()
+
 	// Run the process and wait for it to complete
 	cmd.ExtraFiles = []*os.File{phrasefd}
 	err = cmd.Run()
@@ -253,7 +295,12 @@ func download(w http.ResponseWriter, req *http.Request) {
 	// TODO: Log some kind of auditing/metrics data with auth info, IP addresses, timings
 }
 
+func healthz(w http.ResponseWriter, req *http.Request) {
+	fmt.Fprintln(w, "OK")
+}
+
 func main() {
 	http.HandleFunc("/download", download)
+	http.HandleFunc("/healthz", healthz)
 	http.ListenAndServe(":8000", nil)
 }
